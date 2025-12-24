@@ -6,11 +6,11 @@ let proxyIP = 'sjc.o00o.ooo, proxyip.cmliussss.net';  // 已填入多个，支�
 let password = '3d389407-6072-42af-888e-48d5c7c802da';  // 节点UUID
 let SSpath = '';          // 路径验证，为空则使用UUID作为验证路径
 
-// CF-CDN (默认列表)
+// CF-CDN 
 let cfip = [ // 格式:优选域名:端口#备注名称、优选IP:端口#备注名称、[ipv6优选]:端口#备注名称、优选域名#备注 
     'mfa.gov.ua', 'saas.sin.fan', 'store.ubi.com','cf.130519.xyz','cf.008500.xyz', 
     'cf.090227.xyz', 'cf.877774.xyz','cdns.doon.eu.org','sub.danfeng.eu.org','cf.zhetengsha.eu.org'
-];
+];  // 感谢各位大佬维护的优选域名
 
 function closeSocketQuietly(socket) {
     try { 
@@ -436,7 +436,9 @@ async function forwardataudp(udpChunk, webSocket, respHeader) {
                 }
             },
         }));
-    } catch (error) {}
+    } catch (error) {
+        // console.error('UDP forward error:', error);
+    }
 }
 
 function getSimplePage(request) {
@@ -455,20 +457,23 @@ function getSimplePage(request) {
 export default {
     async fetch(request,env) {
         try {
-            // 支持通过环境变量修改配置
+            // ================= 只有这里是新加的 =================
             if (env.CFIP || env.cfip) {
                 cfip = (env.CFIP || env.cfip).split(',').map(s => s.trim());
             }
+            // ===================================================
+
             if (env.PROXYIP || env.proxyip || env.proxyIP) {
                 proxyIP = env.PROXYIP || env.proxyip || env.proxyIP;
             }
             password = env.PASSWORD || env.password || env.uuid || env.UUID || password;
             subPath = env.SUB_PATH || env.subpath || subPath;
             SSpath = env.SSPATH || env.sspath || SSpath;
-
             if (subPath === 'link' || subPath === '') { subPath = password; }
             if (SSpath === '') { SSpath = password; }
             let validPath = `/${SSpath}`; 
+            
+            // 注意：此处不再强制截取 servers[0]，由 forwardataTCP 处理列表
             
             const method = 'none';
             const url = new URL(request.url);
@@ -477,7 +482,9 @@ export default {
             if (pathname.startsWith('/proxyip=')) {
                 try {
                     pathProxyIP = decodeURIComponent(pathname.substring(9)).trim();
-                } catch (e) {}
+                } catch (e) {
+                    // ingore error
+                }
                 if (pathProxyIP && !request.headers.get('Upgrade')) {
                     proxyIP = pathProxyIP;
                     return new Response(`set proxyIP to: ${proxyIP}\n\n`, {
@@ -497,7 +504,9 @@ export default {
                 if (pathname.startsWith('/proxyip=')) {
                     try {
                         wsPathProxyIP = decodeURIComponent(pathname.substring(9)).trim();
-                    } catch (e) {}
+                    } catch (e) {
+                        // ingore error
+                    }
                 }
                 const customProxyIP = wsPathProxyIP || url.searchParams.get('proxyip') || request.headers.get('proxyip');
                 return await handleSSRequest(request, customProxyIP);
