@@ -1,183 +1,246 @@
-'use strict'
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request));
+});
 
-/**
- * static files (404.html, sw.js, conf.js)
- */
-const ASSET_URL = 'https://geekertao.github.io/gh-proxy/'
-// 前缀，如果自定义路由为example.com/gh/*，将PREFIX改为 '/gh/'，注意，少一个杠都会错！
-const PREFIX = '/'
-// 分支文件使用jsDelivr镜像的开关，0为关闭，默认关闭
-const Config = {
-    jsdelivr: 0
+async function handleRequest(request) {
+  try {
+      const url = new URL(request.url);
+
+      // 如果访问根目录，返回HTML
+      if (url.pathname === "/") {
+          return new Response(getRootHtml(), {
+              headers: {
+                  'Content-Type': 'text/html; charset=utf-8'
+              }
+          });
+      }
+
+      // 从请求路径中提取目标 URL
+      let actualUrlStr = decodeURIComponent(url.pathname.replace("/", ""));
+
+      // 判断用户输入的 URL 是否带有协议
+      actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
+
+      // 保留查询参数
+      actualUrlStr += url.search;
+
+      // 创建新 Headers 对象，排除以 'cf-' 开头的请求头
+      const newHeaders = filterHeaders(request.headers, name => !name.startsWith('cf-'));
+
+      // 创建一个新的请求以访问目标 URL
+      const modifiedRequest = new Request(actualUrlStr, {
+          headers: newHeaders,
+          method: request.method,
+          body: request.body,
+          redirect: 'manual'
+      });
+
+      // 发起对目标 URL 的请求
+      const response = await fetch(modifiedRequest);
+      let body = response.body;
+
+      // 处理重定向
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+          body = response.body;
+          // 创建新的 Response 对象以修改 Location 头部
+          return handleRedirect(response, body);
+      } else if (response.headers.get("Content-Type")?.includes("text/html")) {
+          body = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
+      }
+
+      // 创建修改后的响应对象
+      const modifiedResponse = new Response(body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers
+      });
+
+      // 添加禁用缓存的头部
+      setNoCacheHeaders(modifiedResponse.headers);
+
+      // 添加 CORS 头部，允许跨域访问
+      setCorsHeaders(modifiedResponse.headers);
+
+      return modifiedResponse;
+  } catch (error) {
+      // 如果请求目标地址时出现错误，返回带有错误消息的响应和状态码 500（服务器错误）
+      return jsonResponse({
+          error: error.message
+      }, 500);
+  }
 }
 
-const whiteList = [] // 白名单，路径里面有包含字符的才会通过，e.g. ['/username/']
-
-/** @type {ResponseInit} */
-const PREFLIGHT_INIT = {
-    status: 204,
-    headers: new Headers({
-        'access-control-allow-origin': '*',
-        'access-control-allow-methods': 'GET,POST,PUT,PATCH,TRACE,DELETE,HEAD,OPTIONS',
-        'access-control-max-age': '1728000',
-    }),
+// 确保 URL 带有协议
+function ensureProtocol(url, defaultProtocol) {
+  return url.startsWith("http://") || url.startsWith("https://") ? url : defaultProtocol + "//" + url;
 }
 
-
-const exp1 = /^(?:https?:\/\/)?github\.com\/.+?\/.+?\/(?:releases|archive)\/.*$/i
-const exp2 = /^(?:https?:\/\/)?github\.com\/.+?\/.+?\/(?:blob|raw)\/.*$/i
-const exp3 = /^(?:https?:\/\/)?github\.com\/.+?\/.+?\/(?:info|git-).*$/i
-const exp4 = /^(?:https?:\/\/)?raw\.(?:githubusercontent|github)\.com\/.+?\/.+?\/.+?\/.+$/i
-const exp5 = /^(?:https?:\/\/)?gist\.(?:githubusercontent|github)\.com\/.+?\/.+?\/.+$/i
-const exp6 = /^(?:https?:\/\/)?github\.com\/.+?\/.+?\/tags.*$/i
-const exp7 = /^(?:https?:\/\/)?api\.github\.com\/.*$/i
-
-/**
- * @param {any} body
- * @param {number} status
- * @param {Object<string, string>} headers
- */
-function makeRes(body, status = 200, headers = {}) {
-    headers['access-control-allow-origin'] = '*'
-    return new Response(body, {status, headers})
+// 处理重定向
+function handleRedirect(response, body) {
+  const location = new URL(response.headers.get('location'));
+  const modifiedLocation = `/${encodeURIComponent(location.toString())}`;
+  return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: {
+          ...response.headers,
+          'Location': modifiedLocation
+      }
+  });
 }
 
+// 处理 HTML 内容中的相对路径
+async function handleHtmlContent(response, protocol, host, actualUrlStr) {
+  const originalText = await response.text();
+  const regex = new RegExp('((href|src|action)=["\'])/(?!/)', 'g');
+  let modifiedText = replaceRelativePaths(originalText, protocol, host, new URL(actualUrlStr).origin);
 
-/**
- * @param {string} urlStr
- */
-function newUrl(urlStr) {
-    try {
-        return new URL(urlStr)
-    } catch (err) {
-        return null
-    }
+  return modifiedText;
 }
 
-
-addEventListener('fetch', e => {
-    const ret = fetchHandler(e)
-        .catch(err => makeRes('cfworker error:\n' + err.stack, 502))
-    e.respondWith(ret)
-})
-
-
-function checkUrl(u) {
-    for (let i of [exp1, exp2, exp3, exp4, exp5, exp6, exp7]) {
-        if (u.search(i) === 0) {
-            return true
-        }
-    }
-    return false
+// 替换 HTML 内容中的相对路径
+function replaceRelativePaths(text, protocol, host, origin) {
+  const regex = new RegExp('((href|src|action)=["\'])/(?!/)', 'g');
+  return text.replace(regex, `$1${protocol}//${host}/${origin}/`);
 }
 
-/**
- * @param {FetchEvent} e
- */
-async function fetchHandler(e) {
-    const req = e.request
-    const urlStr = req.url
-    const urlObj = new URL(urlStr)
-    let path = urlObj.searchParams.get('q')
-    if (path) {
-        return Response.redirect('https://' + urlObj.host + PREFIX + path, 301)
-    }
-    // cfworker 会把路径中的 `//` 合并成 `/`
-    path = urlObj.href.substr(urlObj.origin.length + PREFIX.length).replace(/^https?:\/+/, 'https://')
-    if (path.search(exp7) === 0) {
-        return httpHandler(req, path)
-    } else if (path.search(exp1) === 0 || path.search(exp5) === 0 || path.search(exp6) === 0 || path.search(exp3) === 0 || path.search(exp4) === 0) {
-        return httpHandler(req, path)
-    } else if (path.search(exp2) === 0) {
-        if (Config.jsdelivr) {
-            const newUrl = path.replace('/blob/', '@').replace(/^(?:https?:\/\/)?github\.com/, 'https://cdn.jsdelivr.net/gh')
-            return Response.redirect(newUrl, 302)
-        } else {
-            path = path.replace('/blob/', '/raw/')
-            return httpHandler(req, path)
-        }
-    } else if (path.search(exp4) === 0) {
-        const newUrl = path.replace(/(?<=com\/.+?\/.+?)\/(.+?\/)/, '@$1').replace(/^(?:https?:\/\/)?raw\.(?:githubusercontent|github)\.com/, 'https://cdn.jsdelivr.net/gh')
-        return Response.redirect(newUrl, 302)
-    } else {
-        return fetch(ASSET_URL + path)
-    }
+// 返回 JSON 格式的响应
+function jsonResponse(data, status) {
+  return new Response(JSON.stringify(data), {
+      status: status,
+      headers: {
+          'Content-Type': 'application/json; charset=utf-8'
+      }
+  });
 }
 
-
-/**
- * @param {Request} req
- * @param {string} pathname
- */
-function httpHandler(req, pathname) {
-    const reqHdrRaw = req.headers
-
-    // preflight
-    if (req.method === 'OPTIONS' &&
-        reqHdrRaw.has('access-control-request-headers')
-    ) {
-        return new Response(null, PREFLIGHT_INIT)
-    }
-
-    const reqHdrNew = new Headers(reqHdrRaw)
-
-    let urlStr = pathname
-    let flag = !Boolean(whiteList.length)
-    for (let i of whiteList) {
-        if (urlStr.includes(i)) {
-            flag = true
-            break
-        }
-    }
-    if (!flag) {
-        return new Response("blocked", {status: 403})
-    }
-    if (urlStr.search(/^https?:\/\//) !== 0) {
-        urlStr = 'https://' + urlStr
-    }
-    const urlObj = newUrl(urlStr)
-
-    /** @type {RequestInit} */
-    const reqInit = {
-        method: req.method,
-        headers: reqHdrNew,
-        redirect: 'manual',
-        body: req.body
-    }
-    return proxy(urlObj, reqInit)
+// 过滤请求头
+function filterHeaders(headers, filterFunc) {
+  return new Headers([...headers].filter(([name]) => filterFunc(name)));
 }
 
+// 设置禁用缓存的头部
+function setNoCacheHeaders(headers) {
+  headers.set('Cache-Control', 'no-store');
+}
 
-/**
- *
- * @param {URL} urlObj
- * @param {RequestInit} reqInit
- */
-async function proxy(urlObj, reqInit) {
-    const res = await fetch(urlObj.href, reqInit)
-    const resHdrOld = res.headers
-    const resHdrNew = new Headers(resHdrOld)
+// 设置 CORS 头部
+function setCorsHeaders(headers) {
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
+  headers.set('Access-Control-Allow-Headers', '*');
+}
 
-    const status = res.status
-
-    if (resHdrNew.has('location')) {
-        let _location = resHdrNew.get('location')
-        if (checkUrl(_location))
-            resHdrNew.set('location', PREFIX + _location)
-        else {
-            reqInit.redirect = 'follow'
-            return proxy(newUrl(_location), reqInit)
-        }
-    }
-    resHdrNew.set('access-control-expose-headers', '*')
-    resHdrNew.set('access-control-allow-origin', '*')
-
-    resHdrNew.delete('content-security-policy')
-    resHdrNew.delete('content-security-policy-report-only')
-    resHdrNew.delete('clear-site-data')
-
-    return new Response(res.body, {
-        status,
-        headers: resHdrNew,
-    })
+// 返回根目录的 HTML
+function getRootHtml() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <link href="https://s4.zstatic.net/ajax/libs/materialize/1.0.0/css/materialize.min.css" rel="stylesheet">
+  <title>Proxy Everything</title>
+  <link rel="icon" type="image/png" href="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="Description" content="Proxy Everything with CF Workers.">
+  <meta property="og:description" content="Proxy Everything with CF Workers.">
+  <meta property="og:image" content="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="robots" content="index, follow">
+  <meta http-equiv="Content-Language" content="zh-CN">
+  <meta name="copyright" content="Copyright © ymyuuu">
+  <meta name="author" content="ymyuuu">
+  <link rel="apple-touch-icon-precomposed" sizes="120x120" href="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
+  <style>
+      body, html {
+          height: 100%;
+          margin: 0;
+      }
+      .background {
+          background-size: cover;
+          background-position: center;
+          height: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+      }
+      .card {
+          background-color: rgba(255, 255, 255, 0.8);
+          transition: background-color 0.3s ease, box-shadow 0.3s ease;
+      }
+      .card:hover {
+          background-color: rgba(255, 255, 255, 1);
+          box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.3);
+      }
+      .input-field input[type=text] {
+          color: #2c3e50;
+      }
+      .input-field input[type=text]:focus+label {
+          color: #2c3e50 !important;
+      }
+      .input-field input[type=text]:focus {
+          border-bottom: 1px solid #2c3e50 !important;
+          box-shadow: 0 1px 0 0 #2c3e50 !important;
+      }
+      @media (prefers-color-scheme: dark) {
+          body, html {
+              background-color: #121212;
+              color: #e0e0e0;
+          }
+          .card {
+              background-color: rgba(33, 33, 33, 0.9);
+              color: #ffffff;
+          }
+          .card:hover {
+              background-color: rgba(50, 50, 50, 1);
+              box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.6);
+          }
+          .input-field input[type=text] {
+              color: #ffffff;
+          }
+          .input-field input[type=text]:focus+label {
+              color: #ffffff !important;
+          }
+          .input-field input[type=text]:focus {
+              border-bottom: 1px solid #ffffff !important;
+              box-shadow: 0 1px 0 0 #ffffff !important;
+          }
+          label {
+              color: #cccccc;
+          }
+      }
+  </style>
+</head>
+<body>
+  <div class="background">
+      <div class="container">
+          <div class="row">
+              <div class="col s12 m8 offset-m2 l6 offset-l3">
+                  <div class="card">
+                      <div class="card-content">
+                          <span class="card-title center-align"><i class="material-icons left">link</i>Proxy Everything</span>
+                          <form id="urlForm" onsubmit="redirectToProxy(event)">
+                              <div class="input-field">
+                                  <input type="text" id="targetUrl" placeholder="在此输入目标地址" required>
+                                  <label for="targetUrl">目标地址</label>
+                              </div>
+                              <button type="submit" class="btn waves-effect waves-light teal darken-2 full-width">跳转</button>
+                          </form>
+                      </div>
+                  </div>
+              </div>
+          </div>
+      </div>
+  </div>
+  <script src="https://s4.zstatic.net/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
+  <script>
+      function redirectToProxy(event) {
+          event.preventDefault();
+          const targetUrl = document.getElementById('targetUrl').value.trim();
+          const currentOrigin = window.location.origin;
+          window.open(currentOrigin + '/' + encodeURIComponent(targetUrl), '_blank');
+      }
+  </script>
+</body>
+</html>`;
 }
