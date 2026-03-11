@@ -4,6 +4,7 @@ import { connect } from 'cloudflare:sockets';
 
 const CONFIG = {
   UUID:              '9548a98b-a259-4eec-80fb-abdf5f03913b',
+  SERVICE_NAME:      'claudeGrpc',      // gRPC serviceName，客户端路径必须匹配
   MAX_FRAME_SIZE:    4 * 1024 * 1024,  // 单帧最大 4MB
   MAX_BUFFER_SIZE:   8 * 1024 * 1024,  // parser buffer 最大 8MB
   MAX_PENDING_BYTES: 1 * 1024 * 1024,  // 连接建立中 pending queue 最大 1MB
@@ -548,6 +549,15 @@ export default {
     }
     if (!request.body) {
       return new Response('Bad Request', { status: 400 });
+    }
+
+    // 验证 gRPC serviceName（路径末段必须匹配 CONFIG.SERVICE_NAME）
+    // gRPC 请求路径格式: /{package}.{Service}/{Method} 或 /{serviceName}/{method}
+    const url      = new URL(request.url);
+    const segments = url.pathname.split('/').filter(Boolean);
+    // 取路径第一段作为 serviceName（兼容 /serviceName/method 和 /serviceName）
+    if (segments.length === 0 || segments[0] !== CONFIG.SERVICE_NAME) {
+      return new Response('Not Found', { status: 404 });
     }
 
     const { readable, writable } = new TransformStream();
