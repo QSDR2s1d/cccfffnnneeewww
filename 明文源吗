@@ -3,7 +3,7 @@ import { connect } from 'cloudflare:sockets';
 // ─── 配置 ────────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  UUID:              '2523c510-9ff0-415b-9582-93949bfae7e3',
+  UUID:              '9548a98b-a259-4eec-80fb-abdf5f03913b',
   MAX_FRAME_SIZE:    4 * 1024 * 1024,  // 单帧最大 4MB
   MAX_BUFFER_SIZE:   8 * 1024 * 1024,  // parser buffer 最大 8MB
   MAX_PENDING_BYTES: 1 * 1024 * 1024,  // 连接建立中 pending queue 最大 1MB
@@ -44,13 +44,41 @@ function safeEqual(a, b) {
 // ─── SSRF 防护 ───────────────────────────────────────────────────────────────
 
 /**
- * 判断 host 是否为私有/回环/链路本地地址，拦截 SSRF
+ * 将任意形式的 IPv4 表示规范化为 "a.b.c.d" 字符串，失败返回 null
+ * 支持：点分十进制、短格式(A.B / A.B.C)、纯十进制整数
+ * @param {string} h  已小写、已去括号的地址字符串
+ * @returns {string|null}
+ */
+function normalizeIPv4(h) {
+  // 纯十进制整数: 2130706433 → 127.0.0.1
+  if (/^\d+$/.test(h)) {
+    const n = parseInt(h, 10);
+    if (n >= 0 && n <= 0xFFFFFFFF) {
+      return `${(n>>>24)&0xFF}.${(n>>>16)&0xFF}.${(n>>>8)&0xFF}.${n&0xFF}`;
+    }
+    return null;
+  }
+
+  // 点分格式（1-4 段）
+  const parts = h.split('.');
+  if (parts.length < 1 || parts.length > 4) return null;
+  if (!parts.every(p => /^\d{1,3}$/.test(p))) return null;
+
+  // 补足四段（inet_aton 语义：最后一段填充低位）
+  while (parts.length < 4) parts.splice(parts.length - 1, 0, '0');
+  if (parts.some(p => parseInt(p, 10) > 255)) return null;
+  return parts.join('.');
+}
+
+/**
+ * 判断 host 是否为私有/保留/回环/链路本地地址，拦截 SSRF
  *
- * 覆盖绕过方式：
- *   - 短格式 IP:  "127.1" → 127.0.0.1
- *   - 十进制整数: "2130706433" → 127.0.0.1
- *   - IPv4-mapped IPv6: "::ffff:127.0.0.1"
- *   - FQDN 尾部点: "localhost."
+ * 覆盖所有已知绕过方式：
+ *   · 短格式 IP "127.1"、十进制整数 "2130706433"
+ *   · IPv4-mapped IPv6 ::ffff:x.x.x.x（点分十进制）
+ *   · IPv4-mapped IPv6 ::ffff:aabb:ccdd（十六进制，v4新增）
+ *   · 6to4 地址 2002:aabb:ccdd::/48 → 内嵌 IPv4（v4新增）
+ *   · FQDN 尾部点 "localhost."
  *
  * @param {string} host
  * @returns {boolean}
@@ -59,25 +87,33 @@ function isPrivateHost(host) {
   // 标准化：去除 IPv6 方括号、去除 FQDN 尾部点、转小写
   let h = host.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
 
-  // IPv4-mapped IPv6: ::ffff:x.x.x.x
-  const mapped = h.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (mapped) h = mapped[1];
-
-  // 纯十进制整数 IP（如 2130706433 = 127.0.0.1）
-  if (/^\d+$/.test(h)) {
-    const n = parseInt(h, 10);
-    if (n >= 0 && n <= 0xFFFFFFFF) {
-      h = `${(n>>>24)&0xFF}.${(n>>>16)&0xFF}.${(n>>>8)&0xFF}.${n&0xFF}`;
+  // ── IPv4-mapped IPv6 点分十进制: ::ffff:192.168.1.1 ──
+  const mappedDec = h.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mappedDec) {
+    h = mappedDec[1];
+  } else {
+    // ── IPv4-mapped IPv6 十六进制: ::ffff:aabb:ccdd (v4 新增) ──
+    const mappedHex = h.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (mappedHex) {
+      const hi = parseInt(mappedHex[1], 16);
+      const lo = parseInt(mappedHex[2], 16);
+      h = `${(hi>>>8)&0xFF}.${hi&0xFF}.${(lo>>>8)&0xFF}.${lo&0xFF}`;
+    } else {
+      // ── 6to4: 2002:aabb:ccdd::/48 → 内嵌 IPv4 为 aa.bb.cc.dd (v4 新增) ──
+      const sixToFour = h.match(/^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4})(?::|$)/);
+      if (sixToFour) {
+        const hi = parseInt(sixToFour[1].padStart(4, '0'), 16);
+        const lo = parseInt(sixToFour[2].padStart(4, '0'), 16);
+        h = `${(hi>>>8)&0xFF}.${hi&0xFF}.${(lo>>>8)&0xFF}.${lo&0xFF}`;
+      }
     }
   }
 
-  // 短格式 IP: "127.1" / "10.0.1" → 补足四段
-  const parts = h.split('.');
-  if (parts.length >= 2 && parts.length <= 3 && parts.every(p => /^\d+$/.test(p))) {
-    while (parts.length < 4) parts.splice(parts.length - 1, 0, '0');
-    h = parts.join('.');
-  }
+  // ── 规范化 IPv4（含短格式、十进制整数） ──
+  const normalized = normalizeIPv4(h);
+  if (normalized) h = normalized;
 
+  // ── 私有/保留地址匹配 ──
   return [
     /^localhost$/,
     /^127\./,
@@ -119,7 +155,6 @@ function readVarint(buf, offset) {
  * @returns {Uint8Array}
  */
 function encodeVarint(value) {
-  // Fix E: 拒绝非法输入
   if (!Number.isInteger(value) || value < 0) {
     throw new Error(`[Varint] 无效输入: ${value}`);
   }
@@ -175,24 +210,18 @@ function wrapGrpcFrame(data) {
 
 // ─── gRPC 帧解析器（offset-based，O(n) 内存复制）────────────────────────────
 
-/**
- * Fix D: 原版每次 concat + slice 导致 O(n²) 内存复制。
- * 新版用 chunk 列表 + headPos 全局指针，只在提取完整帧时做一次线性复制。
- */
 class GrpcFrameParser {
   constructor() {
     /** @type {Uint8Array[]} */
     this._chunks  = [];
-    this._total   = 0;  // 所有 chunk 总字节数
-    this._headPos = 0;  // 当前消费起始位置（相对当前 _chunks[0] 起始）
+    this._total   = 0;   // 所有 chunk 总字节数（含已消费部分）
+    this._headPos = 0;   // 当前消费起始（相对 _chunks[0] 起始的偏移）
   }
 
   /** 当前可读字节数 */
-  get _available() {
-    return this._total - this._headPos;
-  }
+  get _available() { return this._total - this._headPos; }
 
-  /** 读取全局偏移 pos 处的字节 */
+  /** 读取全局偏移 pos 处的字节（pos 相对 _chunks[0] 起始） */
   _byteAt(pos) {
     let off = pos;
     for (const c of this._chunks) {
@@ -249,8 +278,7 @@ class GrpcFrameParser {
       if (frameLen > CONFIG.MAX_FRAME_SIZE) {
         throw new Error(`[GrpcParser] 单帧大小异常: ${frameLen}B`);
       }
-      // Fix G: 空帧跳过，不崩溃
-      if (frameLen === 0) {
+      if (frameLen === 0) {            // 空帧：跳过，不崩溃
         this._headPos += 5;
         this._gc();
         continue;
@@ -270,6 +298,23 @@ class GrpcFrameParser {
 const ADDR = { IPV4: 1, DOMAIN: 2, IPV6: 3 };
 
 /**
+ * 验证 hostname 字符合法性（RFC 1123）
+ * 防止控制字符、换行符等注入 CF connect() 调用
+ * @param {string} h
+ */
+function validateHostname(h) {
+  // 长度已在调用前检查（0 和 >253）
+  // 合法字符：字母、数字、连字符、点；首尾必须是字母或数字
+  if (!/^[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?$/.test(h)) {
+    throw new Error('[VLESS] 域名含非法字符');
+  }
+  // 每个 label 不超过 63 字符
+  if (h.split('.').some(label => label.length > 63)) {
+    throw new Error('[VLESS] 域名 label 超长（> 63）');
+  }
+}
+
+/**
  * 解析 VLESS 请求头
  * @param {Uint8Array} buf  裸 VLESS 数据（已剥去 Protobuf 包装）
  * @returns {{ version: number, host: string, port: number, payload: Uint8Array }}
@@ -282,7 +327,7 @@ function parseVlessHeader(buf) {
   const version = buf[ptr++];
   if (version !== 0) throw new Error(`[VLESS] 不支持的协议版本: ${version}`);
 
-  // ── UUID (16B) ──
+  // ── UUID (16B) 固定时间比较 ──
   if (!safeEqual(buf.slice(ptr, ptr + 16), SERVER_UUID_BYTES)) {
     throw new Error('[VLESS] UUID 认证失败');
   }
@@ -316,12 +361,12 @@ function parseVlessHeader(buf) {
     }
     case ADDR.DOMAIN: {
       const domainLen = buf[ptr++];
-      // Fix F: 拦截空域名和过长域名
-      if (domainLen === 0) throw new Error('[VLESS] 域名长度不能为 0');
-      if (domainLen > 253) throw new Error(`[VLESS] 域名过长: ${domainLen}B`);
+      if (domainLen === 0)   throw new Error('[VLESS] 域名长度不能为 0');
+      if (domainLen > 253)   throw new Error('[VLESS] 域名过长');
       if (ptr + domainLen > buf.length) throw new Error('[VLESS] 域名数据不足');
       host = new TextDecoder().decode(buf.slice(ptr, ptr + domainLen));
       ptr += domainLen;
+      validateHostname(host);   // v4: 字符合法性验证
       break;
     }
     case ADDR.IPV6: {
@@ -338,8 +383,8 @@ function parseVlessHeader(buf) {
       throw new Error(`[VLESS] 未知地址类型: ${addrType}`);
   }
 
-  // SSRF 防护
-  if (isPrivateHost(host)) throw new Error(`[VLESS] 拒绝访问私有地址`);
+  // SSRF 防护（覆盖所有已知绕过形式）
+  if (isPrivateHost(host)) throw new Error('[VLESS] 拒绝访问私有地址');
 
   return { version, host, port, payload: buf.slice(ptr) };
 }
@@ -348,8 +393,8 @@ function parseVlessHeader(buf) {
 
 /**
  * 带超时的 TCP 连接
- * Fix C: 超时后显式 close socket，防止 CF socket 资源泄漏
- * Fix（原）: clearTimeout 在 race 结束后立即调用，防 timer 泄漏
+ * - clearTimeout 防 timer 泄漏
+ * - 超时/错误时显式 socket.close() 防 CF socket 资源泄漏
  * @param {string} host
  * @param {number} port
  * @returns {Promise<import('cloudflare:sockets').Socket>}
@@ -360,7 +405,7 @@ async function connectWithTimeout(host, port) {
 
   const timeout = new Promise((_, reject) => {
     timerId = setTimeout(
-      () => reject(new Error(`[TCP] 连接超时`)),
+      () => reject(new Error('[TCP] 连接超时')),
       CONFIG.CONNECT_TIMEOUT
     );
   });
@@ -368,11 +413,10 @@ async function connectWithTimeout(host, port) {
   try {
     await Promise.race([socket.opened, timeout]);
   } catch (e) {
-    // Fix C: 超时或其他错误时关闭已创建的 socket
     try { socket.close(); } catch (_) {}
     throw e;
   } finally {
-    clearTimeout(timerId); // 无论如何清理 timer
+    clearTimeout(timerId);
   }
 
   return socket;
@@ -382,6 +426,7 @@ async function connectWithTimeout(host, port) {
 
 /**
  * 远端 TCP → 客户端（后台运行，不 await）
+ * 每个 chunk 封装为 gRPC 帧后写入 clientWriter。
  * @param {ReadableStreamDefaultReader<Uint8Array>} remoteReader
  * @param {WritableStreamDefaultWriter<Uint8Array>} clientWriter
  */
@@ -404,10 +449,9 @@ async function pipeRemoteToClient(remoteReader, clientWriter) {
 /**
  * 核心逻辑：处理 VLESS over gRPC 双向流
  *
- * Fix A: 引入 pendingQueue + pendingBytes
- *   connectWithTimeout 是异步操作，await 期间如果客户端继续发送数据，
- *   remoteWriter 尚为 null，原版会静默丢弃。
- *   修复：连接建立中的帧入队，连接成功后 flush。
+ * 状态机：
+ *   uninitialized → connecting(首帧到达, await connect) → connected(后续帧正常转发)
+ *   connecting 期间到达的帧暂存 pendingQueue，connect 成功后 flush
  *
  * @param {ReadableStreamDefaultReader<Uint8Array>} clientReader
  * @param {WritableStreamDefaultWriter<Uint8Array>} clientWriter
@@ -418,9 +462,9 @@ async function handleVlessGrpc(clientReader, clientWriter) {
   let remoteWriter    = null;
   let remoteReader    = null;
   let initialized     = false;
-  let connecting      = false;         // Fix A: 正在建立连接的标志
-  let pendingQueue    = [];            // Fix A: 连接中到达的帧
-  let pendingBytes    = 0;             // Fix A: 防 OOM
+  let connecting      = false;
+  let pendingQueue    = [];
+  let pendingBytes    = 0;
 
   try {
     while (true) {
@@ -439,7 +483,6 @@ async function handleVlessGrpc(clientReader, clientWriter) {
           const vlessRaw                         = unwrapProtobuf(frame);
           const { version, host, port, payload } = parseVlessHeader(vlessRaw);
 
-          // Fix I: 日志不打印 host（防止泄露用户访问目标）
           console.log(`[VLESS] new connection → port ${port}`);
 
           remoteSocket = await connectWithTimeout(host, port);
@@ -456,7 +499,7 @@ async function handleVlessGrpc(clientReader, clientWriter) {
           // 首帧携带的应用层数据
           if (payload.length > 0) await remoteWriter.write(payload);
 
-          // Fix A: flush 连接建立期间缓存的帧
+          // flush 连接建立期间缓存的帧
           for (const pending of pendingQueue) {
             await remoteWriter.write(pending);
           }
@@ -464,7 +507,7 @@ async function handleVlessGrpc(clientReader, clientWriter) {
           pendingBytes = 0;
 
         } else if (connecting) {
-          // Fix A: 连接建立中，暂存帧
+          // ── 连接建立中：暂存帧 ──
           const data = unwrapProtobuf(frame);
           pendingBytes += data.length;
           if (pendingBytes > CONFIG.MAX_PENDING_BYTES) {
@@ -473,7 +516,7 @@ async function handleVlessGrpc(clientReader, clientWriter) {
           if (data.length > 0) pendingQueue.push(data);
 
         } else {
-          // ── 后续帧：剥 Protobuf 包装，裸转发 ──
+          // ── 后续帧：裸转发 ──
           const data = unwrapProtobuf(frame);
           if (remoteWriter && data.length > 0) await remoteWriter.write(data);
         }
@@ -486,8 +529,7 @@ async function handleVlessGrpc(clientReader, clientWriter) {
     try { remoteWriter?.releaseLock(); } catch (_) {}
     try { remoteReader?.releaseLock(); } catch (_) {}
     try { remoteSocket?.close();       } catch (_) {}
-    // 兜底：确保任意退出路径都关闭 clientWriter（幂等）
-    try { clientWriter.close();        } catch (_) {}
+    try { clientWriter.close();        } catch (_) {}   // 兜底，幂等
   }
 }
 
@@ -512,7 +554,6 @@ export default {
     const clientReader = request.body.getReader();
     const clientWriter = writable.getWriter();
 
-    // 异步启动，不阻塞 Response 返回（HTTP/2 流式响应要求）
     handleVlessGrpc(clientReader, clientWriter).catch(e =>
       console.error(`[Worker] 未捕获异常: ${e.message}`)
     );
