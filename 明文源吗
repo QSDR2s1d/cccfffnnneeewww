@@ -1,580 +1,246 @@
-import { connect } from 'cloudflare:sockets';
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request));
+});
 
-// ─── 配置 ────────────────────────────────────────────────────────────────────
-
-const CONFIG = {
-  UUID:              '9548a98b-a259-4eec-80fb-abdf5f03913b',
-  SERVICE_NAME:      'claudeGrpc',      // gRPC serviceName，客户端路径必须匹配
-  MAX_FRAME_SIZE:    4 * 1024 * 1024,  // 单帧最大 4MB
-  MAX_BUFFER_SIZE:   8 * 1024 * 1024,  // parser buffer 最大 8MB
-  MAX_PENDING_BYTES: 1 * 1024 * 1024,  // 连接建立中 pending queue 最大 1MB
-  CONNECT_TIMEOUT:   10_000,           // TCP 连接超时 ms
-};
-
-// ─── UUID 工具 ────────────────────────────────────────────────────────────────
-
-/**
- * UUID 字符串 → Uint8Array (16 bytes)
- * @param {string} uuid
- * @returns {Uint8Array}
- */
-function uuidToBytes(uuid) {
-  const hex = uuid.replace(/-/g, '');
-  if (hex.length !== 32) throw new Error(`Invalid UUID: ${uuid}`);
-  const out = new Uint8Array(16);
-  for (let i = 0; i < 16; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  return out;
-}
-
-/** 预计算：服务端 UUID 字节，热路径中零解析开销 */
-const SERVER_UUID_BYTES = uuidToBytes(CONFIG.UUID);
-
-/**
- * 固定时间字节比较，防止 timing attack
- * @param {Uint8Array} a
- * @param {Uint8Array} b
- * @returns {boolean}
- */
-function safeEqual(a, b) {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-  return diff === 0;
-}
-
-// ─── SSRF 防护 ───────────────────────────────────────────────────────────────
-
-/**
- * 将任意形式的 IPv4 表示规范化为 "a.b.c.d" 字符串，失败返回 null
- * 支持：点分十进制、短格式(A.B / A.B.C)、纯十进制整数
- * @param {string} h  已小写、已去括号的地址字符串
- * @returns {string|null}
- */
-function normalizeIPv4(h) {
-  // 纯十进制整数: 2130706433 → 127.0.0.1
-  if (/^\d+$/.test(h)) {
-    const n = parseInt(h, 10);
-    if (n >= 0 && n <= 0xFFFFFFFF) {
-      return `${(n>>>24)&0xFF}.${(n>>>16)&0xFF}.${(n>>>8)&0xFF}.${n&0xFF}`;
-    }
-    return null;
-  }
-
-  // 点分格式（1-4 段）
-  const parts = h.split('.');
-  if (parts.length < 1 || parts.length > 4) return null;
-  if (!parts.every(p => /^\d{1,3}$/.test(p))) return null;
-
-  // 补足四段（inet_aton 语义：最后一段填充低位）
-  while (parts.length < 4) parts.splice(parts.length - 1, 0, '0');
-  if (parts.some(p => parseInt(p, 10) > 255)) return null;
-  return parts.join('.');
-}
-
-/**
- * 判断 host 是否为私有/保留/回环/链路本地地址，拦截 SSRF
- *
- * 覆盖所有已知绕过方式：
- *   · 短格式 IP "127.1"、十进制整数 "2130706433"
- *   · IPv4-mapped IPv6 ::ffff:x.x.x.x（点分十进制）
- *   · IPv4-mapped IPv6 ::ffff:aabb:ccdd（十六进制，v4新增）
- *   · 6to4 地址 2002:aabb:ccdd::/48 → 内嵌 IPv4（v4新增）
- *   · FQDN 尾部点 "localhost."
- *
- * @param {string} host
- * @returns {boolean}
- */
-function isPrivateHost(host) {
-  // 标准化：去除 IPv6 方括号、去除 FQDN 尾部点、转小写
-  let h = host.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
-
-  // ── IPv4-mapped IPv6 点分十进制: ::ffff:192.168.1.1 ──
-  const mappedDec = h.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (mappedDec) {
-    h = mappedDec[1];
-  } else {
-    // ── IPv4-mapped IPv6 十六进制: ::ffff:aabb:ccdd (v4 新增) ──
-    const mappedHex = h.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
-    if (mappedHex) {
-      const hi = parseInt(mappedHex[1], 16);
-      const lo = parseInt(mappedHex[2], 16);
-      h = `${(hi>>>8)&0xFF}.${hi&0xFF}.${(lo>>>8)&0xFF}.${lo&0xFF}`;
-    } else {
-      // ── 6to4: 2002:aabb:ccdd::/48 → 内嵌 IPv4 为 aa.bb.cc.dd (v4 新增) ──
-      const sixToFour = h.match(/^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4})(?::|$)/);
-      if (sixToFour) {
-        const hi = parseInt(sixToFour[1].padStart(4, '0'), 16);
-        const lo = parseInt(sixToFour[2].padStart(4, '0'), 16);
-        h = `${(hi>>>8)&0xFF}.${hi&0xFF}.${(lo>>>8)&0xFF}.${lo&0xFF}`;
-      }
-    }
-  }
-
-  // ── 规范化 IPv4（含短格式、十进制整数） ──
-  const normalized = normalizeIPv4(h);
-  if (normalized) h = normalized;
-
-  // ── 私有/保留地址匹配 ──
-  return [
-    /^localhost$/,
-    /^127\./,
-    /^0\.0\.0\.0$/,
-    /^10\./,
-    /^172\.(1[6-9]|2[0-9]|3[01])\./,
-    /^192\.168\./,
-    /^169\.254\./,        // link-local / AWS / GCP metadata
-    /^::1$/,              // IPv6 loopback
-    /^fc00:/,             // IPv6 ULA
-    /^fd[0-9a-f]{2}:/,   // IPv6 ULA
-  ].some(re => re.test(h));
-}
-
-// ─── Varint / Protobuf ───────────────────────────────────────────────────────
-
-/**
- * 读取 Protobuf Varint
- * 安全：shift >= 28 提前抛出（防 32-bit 有符号溢出），返回值 >>> 0 强制无符号
- * @param {Uint8Array} buf
- * @param {number} offset
- * @returns {{ value: number, nextOffset: number }}
- */
-function readVarint(buf, offset) {
-  let value = 0, shift = 0;
-  while (offset < buf.length) {
-    const b = buf[offset++];
-    value |= (b & 0x7F) << shift;
-    if (!(b & 0x80)) return { value: value >>> 0, nextOffset: offset };
-    shift += 7;
-    if (shift >= 28) throw new Error('[Varint] 数值超出合理范围（>= 2^28）');
-  }
-  throw new Error('[Varint] 数据截断，解析未完成');
-}
-
-/**
- * 编码整数为 Protobuf Varint
- * @param {number} value  非负整数
- * @returns {Uint8Array}
- */
-function encodeVarint(value) {
-  if (!Number.isInteger(value) || value < 0) {
-    throw new Error(`[Varint] 无效输入: ${value}`);
-  }
-  const bytes = [];
-  while (value > 127) {
-    bytes.push((value & 0x7F) | 0x80);
-    value >>>= 7;
-  }
-  bytes.push(value);
-  return new Uint8Array(bytes);
-}
-
-/**
- * 剥离 Protobuf field1 (tag=0x0A) 包装，返回内部裸数据。
- * 首字节非 0x0A 时视为无包装，直接返回原始 buf。
- * @param {Uint8Array} buf
- * @returns {Uint8Array}
- */
-function unwrapProtobuf(buf) {
-  if (buf.length === 0) throw new Error('[Protobuf] 空数据帧');
-  if (buf[0] !== 0x0A) return buf;
-
-  const { value: dataLen, nextOffset } = readVarint(buf, 1);
-  const end = nextOffset + dataLen;
-  if (end > buf.length) {
-    throw new Error(`[Protobuf] 声明长度 ${dataLen}B 超出实际剩余 ${buf.length - nextOffset}B`);
-  }
-  return buf.slice(nextOffset, end);
-}
-
-/**
- * 将裸数据包装为 Protobuf field1 + gRPC 帧
- * @param {Uint8Array} data
- * @returns {Uint8Array}
- */
-function wrapGrpcFrame(data) {
-  const varint    = encodeVarint(data.length);
-  const pbPayload = new Uint8Array(1 + varint.length + data.length);
-  pbPayload[0] = 0x0A;
-  pbPayload.set(varint, 1);
-  pbPayload.set(data,   1 + varint.length);
-
-  const frame = new Uint8Array(5 + pbPayload.length);
-  frame[0] = 0x00; // uncompressed
-  const len = pbPayload.length;
-  frame[1] = (len >>> 24) & 0xFF;
-  frame[2] = (len >>> 16) & 0xFF;
-  frame[3] = (len >>>  8) & 0xFF;
-  frame[4] =  len         & 0xFF;
-  frame.set(pbPayload, 5);
-  return frame;
-}
-
-// ─── gRPC 帧解析器（offset-based，O(n) 内存复制）────────────────────────────
-
-class GrpcFrameParser {
-  constructor() {
-    /** @type {Uint8Array[]} */
-    this._chunks  = [];
-    this._total   = 0;   // 所有 chunk 总字节数（含已消费部分）
-    this._headPos = 0;   // 当前消费起始（相对 _chunks[0] 起始的偏移）
-  }
-
-  /** 当前可读字节数 */
-  get _available() { return this._total - this._headPos; }
-
-  /** 读取全局偏移 pos 处的字节（pos 相对 _chunks[0] 起始） */
-  _byteAt(pos) {
-    let off = pos;
-    for (const c of this._chunks) {
-      if (off < c.length) return c[off];
-      off -= c.length;
-    }
-    return undefined;
-  }
-
-  /** 提取 [start, end) 的字节为新 Uint8Array */
-  _sliceOut(start, end) {
-    const out = new Uint8Array(end - start);
-    let written = 0, off = start;
-    for (const c of this._chunks) {
-      if (off >= c.length) { off -= c.length; continue; }
-      const take = Math.min(c.length - off, end - start - written);
-      out.set(c.subarray(off, off + take), written);
-      written += take;
-      off = 0;
-      if (written >= end - start) break;
-    }
-    return out;
-  }
-
-  /** 丢弃已完全消费的 chunk，释放内存 */
-  _gc() {
-    while (this._chunks.length > 0 && this._headPos >= this._chunks[0].length) {
-      this._headPos -= this._chunks[0].length;
-      this._total   -= this._chunks[0].length;
-      this._chunks.shift();
-    }
-  }
-
-  /**
-   * 追加数据，返回本次解析出的所有完整帧 payload
-   * @param {Uint8Array} chunk
-   * @returns {Uint8Array[]}
-   */
-  push(chunk) {
-    if (this._available + chunk.length > CONFIG.MAX_BUFFER_SIZE) {
-      throw new Error(`[GrpcParser] Buffer 超出上限 ${CONFIG.MAX_BUFFER_SIZE}B`);
-    }
-    this._chunks.push(chunk);
-    this._total += chunk.length;
-
-    const frames = [];
-    while (this._available >= 5) {
-      const p = this._headPos;
-      const frameLen = ((this._byteAt(p+1) << 24) >>> 0) |
-                        (this._byteAt(p+2) << 16) |
-                        (this._byteAt(p+3) <<  8) |
-                         this._byteAt(p+4);
-
-      if (frameLen > CONFIG.MAX_FRAME_SIZE) {
-        throw new Error(`[GrpcParser] 单帧大小异常: ${frameLen}B`);
-      }
-      if (frameLen === 0) {            // 空帧：跳过，不崩溃
-        this._headPos += 5;
-        this._gc();
-        continue;
-      }
-      if (this._available < 5 + frameLen) break;
-
-      frames.push(this._sliceOut(p + 5, p + 5 + frameLen));
-      this._headPos += 5 + frameLen;
-      this._gc();
-    }
-    return frames;
-  }
-}
-
-// ─── VLESS 解析 ───────────────────────────────────────────────────────────────
-
-const ADDR = { IPV4: 1, DOMAIN: 2, IPV6: 3 };
-
-/**
- * 验证 hostname 字符合法性（RFC 1123）
- * 防止控制字符、换行符等注入 CF connect() 调用
- * @param {string} h
- */
-function validateHostname(h) {
-  // 长度已在调用前检查（0 和 >253）
-  // 合法字符：字母、数字、连字符、点；首尾必须是字母或数字
-  if (!/^[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?$/.test(h)) {
-    throw new Error('[VLESS] 域名含非法字符');
-  }
-  // 每个 label 不超过 63 字符
-  if (h.split('.').some(label => label.length > 63)) {
-    throw new Error('[VLESS] 域名 label 超长（> 63）');
-  }
-}
-
-/**
- * 解析 VLESS 请求头
- * @param {Uint8Array} buf  裸 VLESS 数据（已剥去 Protobuf 包装）
- * @returns {{ version: number, host: string, port: number, payload: Uint8Array }}
- */
-function parseVlessHeader(buf) {
-  let ptr = 0;
-
-  // ── Version (1B) ──
-  if (buf.length < 18) throw new Error('[VLESS] 数据包过短（< 18B）');
-  const version = buf[ptr++];
-  if (version !== 0) throw new Error(`[VLESS] 不支持的协议版本: ${version}`);
-
-  // ── UUID (16B) 固定时间比较 ──
-  if (!safeEqual(buf.slice(ptr, ptr + 16), SERVER_UUID_BYTES)) {
-    throw new Error('[VLESS] UUID 认证失败');
-  }
-  ptr += 16;
-
-  // ── Addon (1B len + nB data) ──
-  const addonLen = buf[ptr++];
-  ptr += addonLen;
-  if (ptr + 4 > buf.length) throw new Error('[VLESS] 命令头数据不足');
-
-  // ── Command (1B) ──
-  const cmd = buf[ptr++];
-  if (cmd === 2) throw new Error('[VLESS] UDP 命令暂不支持');
-  if (cmd !== 1) throw new Error(`[VLESS] 未知命令: ${cmd}`);
-
-  // ── Port (2B big-endian) ──
-  const port = (buf[ptr] << 8) | buf[ptr + 1];
-  ptr += 2;
-  if (port < 1 || port > 65535) throw new Error(`[VLESS] 非法端口: ${port}`);
-
-  // ── Address Type (1B) + Address ──
-  const addrType = buf[ptr++];
-  let host;
-
-  switch (addrType) {
-    case ADDR.IPV4: {
-      if (ptr + 4 > buf.length) throw new Error('[VLESS] IPv4 地址数据不足');
-      host = Array.from(buf.slice(ptr, ptr + 4)).join('.');
-      ptr += 4;
-      break;
-    }
-    case ADDR.DOMAIN: {
-      const domainLen = buf[ptr++];
-      if (domainLen === 0)   throw new Error('[VLESS] 域名长度不能为 0');
-      if (domainLen > 253)   throw new Error('[VLESS] 域名过长');
-      if (ptr + domainLen > buf.length) throw new Error('[VLESS] 域名数据不足');
-      host = new TextDecoder().decode(buf.slice(ptr, ptr + domainLen));
-      ptr += domainLen;
-      validateHostname(host);   // v4: 字符合法性验证
-      break;
-    }
-    case ADDR.IPV6: {
-      if (ptr + 16 > buf.length) throw new Error('[VLESS] IPv6 地址数据不足');
-      const groups = [];
-      for (let i = 0; i < 8; i++) {
-        groups.push(((buf[ptr + i*2] << 8) | buf[ptr + i*2 + 1]).toString(16));
-      }
-      host = `[${groups.join(':')}]`;
-      ptr += 16;
-      break;
-    }
-    default:
-      throw new Error(`[VLESS] 未知地址类型: ${addrType}`);
-  }
-
-  // SSRF 防护（覆盖所有已知绕过形式）
-  if (isPrivateHost(host)) throw new Error('[VLESS] 拒绝访问私有地址');
-
-  return { version, host, port, payload: buf.slice(ptr) };
-}
-
-// ─── TCP 连接 ─────────────────────────────────────────────────────────────────
-
-/**
- * 带超时的 TCP 连接
- * - clearTimeout 防 timer 泄漏
- * - 超时/错误时显式 socket.close() 防 CF socket 资源泄漏
- * @param {string} host
- * @param {number} port
- * @returns {Promise<import('cloudflare:sockets').Socket>}
- */
-async function connectWithTimeout(host, port) {
-  const socket = connect({ hostname: host, port });
-  let timerId;
-
-  const timeout = new Promise((_, reject) => {
-    timerId = setTimeout(
-      () => reject(new Error('[TCP] 连接超时')),
-      CONFIG.CONNECT_TIMEOUT
-    );
-  });
-
+async function handleRequest(request) {
   try {
-    await Promise.race([socket.opened, timeout]);
-  } catch (e) {
-    try { socket.close(); } catch (_) {}
-    throw e;
-  } finally {
-    clearTimeout(timerId);
-  }
+      const url = new URL(request.url);
 
-  return socket;
-}
-
-// ─── 双向管道 ─────────────────────────────────────────────────────────────────
-
-/**
- * 远端 TCP → 客户端（后台运行，不 await）
- * 每个 chunk 封装为 gRPC 帧后写入 clientWriter。
- * @param {ReadableStreamDefaultReader<Uint8Array>} remoteReader
- * @param {WritableStreamDefaultWriter<Uint8Array>} clientWriter
- */
-async function pipeRemoteToClient(remoteReader, clientWriter) {
-  try {
-    while (true) {
-      const { done, value } = await remoteReader.read();
-      if (done) break;
-      await clientWriter.write(wrapGrpcFrame(value));
-    }
-  } catch (e) {
-    console.error(`[remote→client] ${e.message}`);
-  } finally {
-    try { await clientWriter.close(); } catch (_) {}
-  }
-}
-
-// ─── 主流处理 ─────────────────────────────────────────────────────────────────
-
-/**
- * 核心逻辑：处理 VLESS over gRPC 双向流
- *
- * 状态机：
- *   uninitialized → connecting(首帧到达, await connect) → connected(后续帧正常转发)
- *   connecting 期间到达的帧暂存 pendingQueue，connect 成功后 flush
- *
- * @param {ReadableStreamDefaultReader<Uint8Array>} clientReader
- * @param {WritableStreamDefaultWriter<Uint8Array>} clientWriter
- */
-async function handleVlessGrpc(clientReader, clientWriter) {
-  const parser        = new GrpcFrameParser();
-  let remoteSocket    = null;
-  let remoteWriter    = null;
-  let remoteReader    = null;
-  let initialized     = false;
-  let connecting      = false;
-  let pendingQueue    = [];
-  let pendingBytes    = 0;
-
-  try {
-    while (true) {
-      const { done, value } = await clientReader.read();
-      if (done) break;
-
-      const frames = parser.push(value);
-
-      for (const frame of frames) {
-
-        if (!initialized) {
-          // ── 首帧：认证 + 解析 + 建立远端连接 ──
-          initialized = true;
-          connecting  = true;
-
-          const vlessRaw                         = unwrapProtobuf(frame);
-          const { version, host, port, payload } = parseVlessHeader(vlessRaw);
-
-          console.log(`[VLESS] new connection → port ${port}`);
-
-          remoteSocket = await connectWithTimeout(host, port);
-          remoteWriter = remoteSocket.writable.getWriter();
-          remoteReader = remoteSocket.readable.getReader();
-          connecting   = false;
-
-          // VLESS 响应头：version byte + 0x00
-          await clientWriter.write(wrapGrpcFrame(new Uint8Array([version, 0x00])));
-
-          // 后台启动远端→客户端管道
-          pipeRemoteToClient(remoteReader, clientWriter);
-
-          // 首帧携带的应用层数据
-          if (payload.length > 0) await remoteWriter.write(payload);
-
-          // flush 连接建立期间缓存的帧
-          for (const pending of pendingQueue) {
-            await remoteWriter.write(pending);
-          }
-          pendingQueue = [];
-          pendingBytes = 0;
-
-        } else if (connecting) {
-          // ── 连接建立中：暂存帧 ──
-          const data = unwrapProtobuf(frame);
-          pendingBytes += data.length;
-          if (pendingBytes > CONFIG.MAX_PENDING_BYTES) {
-            throw new Error(`[VLESS] pending queue 超出上限 ${CONFIG.MAX_PENDING_BYTES}B`);
-          }
-          if (data.length > 0) pendingQueue.push(data);
-
-        } else {
-          // ── 后续帧：裸转发 ──
-          const data = unwrapProtobuf(frame);
-          if (remoteWriter && data.length > 0) await remoteWriter.write(data);
-        }
+      // 如果访问根目录，返回HTML
+      if (url.pathname === "/") {
+          return new Response(getRootHtml(), {
+              headers: {
+                  'Content-Type': 'text/html; charset=utf-8'
+              }
+          });
       }
-    }
-  } catch (e) {
-    console.error(`[handleVlessGrpc] ${e.message}`);
-  } finally {
-    pendingQueue = [];
-    try { remoteWriter?.releaseLock(); } catch (_) {}
-    try { remoteReader?.releaseLock(); } catch (_) {}
-    try { remoteSocket?.close();       } catch (_) {}
-    try { clientWriter.close();        } catch (_) {}   // 兜底，幂等
+
+      // 从请求路径中提取目标 URL
+      let actualUrlStr = decodeURIComponent(url.pathname.replace("/", ""));
+
+      // 判断用户输入的 URL 是否带有协议
+      actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
+
+      // 保留查询参数
+      actualUrlStr += url.search;
+
+      // 创建新 Headers 对象，排除以 'cf-' 开头的请求头
+      const newHeaders = filterHeaders(request.headers, name => !name.startsWith('cf-'));
+
+      // 创建一个新的请求以访问目标 URL
+      const modifiedRequest = new Request(actualUrlStr, {
+          headers: newHeaders,
+          method: request.method,
+          body: request.body,
+          redirect: 'manual'
+      });
+
+      // 发起对目标 URL 的请求
+      const response = await fetch(modifiedRequest);
+      let body = response.body;
+
+      // 处理重定向
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+          body = response.body;
+          // 创建新的 Response 对象以修改 Location 头部
+          return handleRedirect(response, body);
+      } else if (response.headers.get("Content-Type")?.includes("text/html")) {
+          body = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
+      }
+
+      // 创建修改后的响应对象
+      const modifiedResponse = new Response(body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers
+      });
+
+      // 添加禁用缓存的头部
+      setNoCacheHeaders(modifiedResponse.headers);
+
+      // 添加 CORS 头部，允许跨域访问
+      setCorsHeaders(modifiedResponse.headers);
+
+      return modifiedResponse;
+  } catch (error) {
+      // 如果请求目标地址时出现错误，返回带有错误消息的响应和状态码 500（服务器错误）
+      return jsonResponse({
+          error: error.message
+      }, 500);
   }
 }
 
-// ─── Worker 入口 ──────────────────────────────────────────────────────────────
+// 确保 URL 带有协议
+function ensureProtocol(url, defaultProtocol) {
+  return url.startsWith("http://") || url.startsWith("https://") ? url : defaultProtocol + "//" + url;
+}
 
-export default {
-  /**
-   * @param {Request} request
-   * @returns {Promise<Response>}
-   */
-  async fetch(request) {
-    const contentType = request.headers.get('content-type') ?? '';
-
-    if (request.method !== 'POST' || !contentType.startsWith('application/grpc')) {
-      return new Response('Not Found', { status: 404 });
-    }
-    if (!request.body) {
-      return new Response('Bad Request', { status: 400 });
-    }
-
-    // 验证 gRPC serviceName（路径末段必须匹配 CONFIG.SERVICE_NAME）
-    // gRPC 请求路径格式: /{package}.{Service}/{Method} 或 /{serviceName}/{method}
-    const url      = new URL(request.url);
-    const segments = url.pathname.split('/').filter(Boolean);
-    // 取路径第一段作为 serviceName（兼容 /serviceName/method 和 /serviceName）
-    if (segments.length === 0 || segments[0] !== CONFIG.SERVICE_NAME) {
-      return new Response('Not Found', { status: 404 });
-    }
-
-    const { readable, writable } = new TransformStream();
-    const clientReader = request.body.getReader();
-    const clientWriter = writable.getWriter();
-
-    handleVlessGrpc(clientReader, clientWriter).catch(e =>
-      console.error(`[Worker] 未捕获异常: ${e.message}`)
-    );
-
-    return new Response(readable, {
-      status: 200,
+// 处理重定向
+function handleRedirect(response, body) {
+  const location = new URL(response.headers.get('location'));
+  const modifiedLocation = `/${encodeURIComponent(location.toString())}`;
+  return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
       headers: {
-        'Content-Type':  'application/grpc+proto',
-        'grpc-status':   '0',
-        'grpc-message':  '',
-      },
-    });
-  },
-};
+          ...response.headers,
+          'Location': modifiedLocation
+      }
+  });
+}
+
+// 处理 HTML 内容中的相对路径
+async function handleHtmlContent(response, protocol, host, actualUrlStr) {
+  const originalText = await response.text();
+  const regex = new RegExp('((href|src|action)=["\'])/(?!/)', 'g');
+  let modifiedText = replaceRelativePaths(originalText, protocol, host, new URL(actualUrlStr).origin);
+
+  return modifiedText;
+}
+
+// 替换 HTML 内容中的相对路径
+function replaceRelativePaths(text, protocol, host, origin) {
+  const regex = new RegExp('((href|src|action)=["\'])/(?!/)', 'g');
+  return text.replace(regex, `$1${protocol}//${host}/${origin}/`);
+}
+
+// 返回 JSON 格式的响应
+function jsonResponse(data, status) {
+  return new Response(JSON.stringify(data), {
+      status: status,
+      headers: {
+          'Content-Type': 'application/json; charset=utf-8'
+      }
+  });
+}
+
+// 过滤请求头
+function filterHeaders(headers, filterFunc) {
+  return new Headers([...headers].filter(([name]) => filterFunc(name)));
+}
+
+// 设置禁用缓存的头部
+function setNoCacheHeaders(headers) {
+  headers.set('Cache-Control', 'no-store');
+}
+
+// 设置 CORS 头部
+function setCorsHeaders(headers) {
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
+  headers.set('Access-Control-Allow-Headers', '*');
+}
+
+// 返回根目录的 HTML
+function getRootHtml() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <link href="https://s4.zstatic.net/ajax/libs/materialize/1.0.0/css/materialize.min.css" rel="stylesheet">
+  <title>Proxy Everything</title>
+  <link rel="icon" type="image/png" href="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="Description" content="Proxy Everything with CF Workers.">
+  <meta property="og:description" content="Proxy Everything with CF Workers.">
+  <meta property="og:image" content="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="robots" content="index, follow">
+  <meta http-equiv="Content-Language" content="zh-CN">
+  <meta name="copyright" content="Copyright © ymyuuu">
+  <meta name="author" content="ymyuuu">
+  <link rel="apple-touch-icon-precomposed" sizes="120x120" href="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
+  <style>
+      body, html {
+          height: 100%;
+          margin: 0;
+      }
+      .background {
+          background-size: cover;
+          background-position: center;
+          height: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+      }
+      .card {
+          background-color: rgba(255, 255, 255, 0.8);
+          transition: background-color 0.3s ease, box-shadow 0.3s ease;
+      }
+      .card:hover {
+          background-color: rgba(255, 255, 255, 1);
+          box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.3);
+      }
+      .input-field input[type=text] {
+          color: #2c3e50;
+      }
+      .input-field input[type=text]:focus+label {
+          color: #2c3e50 !important;
+      }
+      .input-field input[type=text]:focus {
+          border-bottom: 1px solid #2c3e50 !important;
+          box-shadow: 0 1px 0 0 #2c3e50 !important;
+      }
+      @media (prefers-color-scheme: dark) {
+          body, html {
+              background-color: #121212;
+              color: #e0e0e0;
+          }
+          .card {
+              background-color: rgba(33, 33, 33, 0.9);
+              color: #ffffff;
+          }
+          .card:hover {
+              background-color: rgba(50, 50, 50, 1);
+              box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.6);
+          }
+          .input-field input[type=text] {
+              color: #ffffff;
+          }
+          .input-field input[type=text]:focus+label {
+              color: #ffffff !important;
+          }
+          .input-field input[type=text]:focus {
+              border-bottom: 1px solid #ffffff !important;
+              box-shadow: 0 1px 0 0 #ffffff !important;
+          }
+          label {
+              color: #cccccc;
+          }
+      }
+  </style>
+</head>
+<body>
+  <div class="background">
+      <div class="container">
+          <div class="row">
+              <div class="col s12 m8 offset-m2 l6 offset-l3">
+                  <div class="card">
+                      <div class="card-content">
+                          <span class="card-title center-align"><i class="material-icons left">link</i>Proxy Everything</span>
+                          <form id="urlForm" onsubmit="redirectToProxy(event)">
+                              <div class="input-field">
+                                  <input type="text" id="targetUrl" placeholder="在此输入目标地址" required>
+                                  <label for="targetUrl">目标地址</label>
+                              </div>
+                              <button type="submit" class="btn waves-effect waves-light teal darken-2 full-width">跳转</button>
+                          </form>
+                      </div>
+                  </div>
+              </div>
+          </div>
+      </div>
+  </div>
+  <script src="https://s4.zstatic.net/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
+  <script>
+      function redirectToProxy(event) {
+          event.preventDefault();
+          const targetUrl = document.getElementById('targetUrl').value.trim();
+          const currentOrigin = window.location.origin;
+          window.open(currentOrigin + '/' + encodeURIComponent(targetUrl), '_blank');
+      }
+  </script>
+</body>
+</html>`;
+}
