@@ -438,7 +438,7 @@ eQ6OFb9LbLYL9f+sAiAffoMbi4y/0YUSlTtz7as9S8/lciBF5VCUoVIKS+vX2g==
           ],
           "transport": {
             "type": "ws",
-            "path": "/vmess-argo",
+            "path": "/dkEo5c/-poL39i",
             "early_data_header_name": "Sec-WebSocket-Protocol"
           }
         }
@@ -449,17 +449,17 @@ eQ6OFb9LbLYL9f+sAiAffoMbi4y/0YUSlTtz7as9S8/lciBF5VCUoVIKS+vX2g==
           "tag": "wireguard-out",
           "mtu": 1280,
           "address": [
-              "172.16.0.2/32",
-              "2606:4700:110:8dfe:d141:69bb:6b80:925/128"
+              "100.96.0.31/32",
+              "2606:4700:cf1:1000::1f/128"
           ],
-          "private_key": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
+          "private_key": "EAJRQUFCUA3QxOOA7wY7KIoRUnZG0NDOgJIBErVT70M=",
           "peers": [
             {
-              "address": "engage.cloudflareclient.com",
+              "address": "162.159.193.7",
               "port": 2408,
               "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
               "allowed_ips": ["0.0.0.0/0", "::/0"],
-              "reserved": [78, 135, 76]
+              "reserved": [201, 245, 218]
             }
           ]
         }
@@ -480,16 +480,23 @@ eQ6OFb9LbLYL9f+sAiAffoMbi4y/0YUSlTtz7as9S8/lciBF5VCUoVIKS+vX2g==
             "download_detour": "direct"
           },
           {
-            "tag": "openai",
+            "tag": "category-ai-!cn",
             "type": "remote",
             "format": "binary",
-            "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/openai.srs",
+            "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ai-!cn.srs",
+            "download_detour": "direct"
+          },
+          {
+            "tag": "category-porn",
+            "type": "remote",
+            "format": "binary",
+            "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-porn.srs",
             "download_detour": "direct"
           }
         ],
         "rules": [
           {
-            "rule_set": ["openai", "netflix"],
+            "rule_set": ["category-ai-!cn", "netflix", "category-porn"],
             "outbound": "wireguard-out"
           }
         ],
@@ -978,7 +985,7 @@ async function generateLinks(argoDomain) {
 
       // 只有当 DISABLE_ARGO 不为 'true' 且 argoDomain 存在时才生成默认的 vmess 节点
       if ((DISABLE_ARGO !== 'true' && DISABLE_ARGO !== true) && argoDomain) {
-        const vmessNode = `vmess://${Buffer.from(JSON.stringify({ v: '2', ps: `${nodeName}`, add: CFIP, port: CFPORT, id: UUID, aid: '0', scy: 'auto', net: 'ws', type: 'none', host: argoDomain, path: '/vmess-argo?ed=2560', tls: 'tls', sni: argoDomain, alpn: '', fp: 'firefox'})).toString('base64')}`;
+        const vmessNode = `vmess://${Buffer.from(JSON.stringify({ v: '2', ps: `${nodeName}`, add: CFIP, port: CFPORT, id: UUID, aid: '0', scy: 'auto', net: 'ws', type: 'none', host: argoDomain, path: '/dkEo5c/-poL39i?ed=2560', tls: 'tls', sni: argoDomain, alpn: '', fp: 'firefox'})).toString('base64')}`;
         subTxt = vmessNode;
       }
 
