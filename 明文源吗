@@ -662,7 +662,7 @@ export default {
             }
             if (path.toLowerCase() === `/sub/${yourUUID}`) {
                 const port = 443,
-                    nodePath = '/gwF22V/0DppCI',
+                    nodePath = BASE_PATH,
                     sni = url.searchParams.get('sni') || url.hostname,
                     currentHost = url.hostname
                 const subscription = generate_subscription(cfg.UUID, cfip, port, nodePath, sni, currentHost, cfg.PROXYIP)
